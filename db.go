@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/golang/groupcache/lru"
 	"github.com/golang/groupcache/singleflight"
+	"github.com/ryszard/goskiplist/skiplist"
 	"io"
 	"os"
 	"sort"
@@ -53,22 +54,8 @@ type chunkMeta struct {
 	Chunk *chunk
 }
 
-type chunkMetas []*chunkMeta
-
-func (cm chunkMetas) Len() int {
-	return len(cm)
-}
-
-func (cm chunkMetas) Less(i, j int) bool {
-	return bytes.Compare(cm[i].StartKey, cm[j].StartKey) == -1
-}
-
-func (cm chunkMetas) Swap(i, j int) {
-	cm[i], cm[j] = cm[j], cm[i]
-}
-
 type DB struct {
-	metas     chunkMetas
+	metas     *skiplist.SkipList
 	chunkPool *lru.Cache
 	chunkLock sync.Mutex
 	file      *os.File
@@ -154,7 +141,7 @@ func (db *DB) preprocess(file *os.File, dump *os.File) error {
 			if meta == nil {
 				return err
 			}
-			db.metas = append(db.metas, meta)
+			db.metas.Set(meta.StartKey, meta)
 		}
 
 		if err == io.EOF {
@@ -173,18 +160,19 @@ func (db *DB) Init(path string) error {
 	if err != nil {
 		return err
 	}
-
 	dumpfile, err := os.Create("db.dump")
 	if err != nil {
 		return err
 	}
 
+	// meta skiplist
+	db.metas = skiplist.NewCustomMap(func(l, r interface{}) bool {
+		return bytes.Compare(l.([]byte), r.([]byte)) == -1
+	})
 	// read and construct each Chunk and Meta
 	if err = db.preprocess(file, dumpfile); err != nil {
 		return err
 	}
-	// sort Meta
-	sort.Sort(db.metas)
 	// initialise Chunk pool
 	db.chunkPool = lru.New(MaxChunks)
 	db.chunkPool.OnEvicted = func(key lru.Key, value interface{}) {
@@ -197,23 +185,22 @@ func (db *DB) Init(path string) error {
 }
 
 func (db *DB) Get(key []byte) []byte {
-	idx := sort.Search(len(db.metas), func(i int) bool {
-		return bytes.Compare(db.metas[i].StartKey, key) == -1
-	})
+	iter := db.metas.Seek(key)
 
-	if idx >= len(db.metas) {
+	if iter == nil {
 		return nil
 	}
 
 	var newchunk *chunk
-	if db.metas[idx].Chunk != nil {
-		newchunk = db.metas[idx].Chunk
+	meta := iter.Value().(*chunkMeta)
+	if meta.Chunk != nil {
+		newchunk = meta.Chunk
 	} else {
 		// disk io
 		// locked inside singleflight
-		c, err := db.single.Do(strconv.Itoa(idx), func() (i interface{}, e error) {
-			buf := make([]byte, db.metas[idx].Len)
-			if _, e := db.file.ReadAt(buf, db.metas[idx].StartLoc); e != nil && e != io.EOF {
+		c, err := db.single.Do(strconv.Itoa(meta.ID), func() (i interface{}, e error) {
+			buf := make([]byte, meta.Len)
+			if _, e := db.file.ReadAt(buf, meta.StartLoc); e != nil && e != io.EOF {
 				return nil, e
 			}
 
@@ -233,14 +220,14 @@ func (db *DB) Get(key []byte) []byte {
 
 		// add to lru
 		db.chunkLock.Lock()
-		db.chunkPool.Add(idx, c.(*chunk))
+		db.chunkPool.Add(meta.ID, c.(*chunk))
 		db.chunkLock.Unlock()
 
-		db.metas[idx].Chunk = c.(*chunk)
+		meta.Chunk = c.(*chunk)
 		newchunk = c.(*chunk)
 	}
 
-	idx = sort.Search(len(newchunk.KVs), func(i int) bool {
+	idx := sort.Search(len(newchunk.KVs), func(i int) bool {
 		return bytes.Compare(newchunk.KVs[i].Key, key) == 0
 	})
 
