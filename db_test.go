@@ -2,6 +2,7 @@ package kvdb
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"math/rand"
@@ -14,6 +15,7 @@ var (
 	ini  sync.Once
 	num  = 100
 	file *os.File
+	keys [][]byte
 )
 
 func initFile() {
@@ -29,6 +31,7 @@ func initFile() {
 			idx := rand.Intn(len(chars))
 			key[j] = chars[idx]
 		}
+		keys = append(keys, key)
 
 		valSize := rand.Intn(10) + 1
 		val := make([]byte, valSize)
@@ -86,7 +89,7 @@ func TestChunk_Preprocess(t *testing.T) {
 		t.Fatalf("failed to preprocess file: %v", err)
 	}
 
-	fmt.Println(db.metas.Len())
+	fmt.Println(len(db.metas))
 }
 
 func TestDB_Init(t *testing.T) {
@@ -97,7 +100,31 @@ func TestDB_Init(t *testing.T) {
 		t.Fatalf("failed to init db: %v\n", err)
 	}
 
-	fmt.Println(db)
+	for i := 0; i < db.metas.Len()-1; i++ {
+		if bytes.Compare(db.metas[i].StartKey, db.metas[i+1].StartKey) > 0 {
+			t.Fatalf("unsorted")
+		}
+	}
+
+	fmt.Println(len(db.metas))
+}
+
+func TestDB_lowerSearchMeta(t *testing.T) {
+	ini.Do(initFile)
+	db := DB{}
+	err := db.Init("test.dat")
+	if err != nil {
+		t.Fatalf("failed to init db: %v\n", err)
+	}
+	fmt.Println(len(db.metas))
+	meta, idx := db.lowerSearchMeta([]byte("mmm"))
+	if meta == nil {
+		t.Fatalf("meta nil")
+	}
+	if bytes.Compare(db.metas[idx-1].StartKey, []byte("mmm")) >= 0 ||
+		bytes.Compare(db.metas[idx].StartKey, []byte("mmm")) <= 0 {
+		t.Fatalf("unsorted")
+	}
 }
 
 func TestDB_Get(t *testing.T) {
@@ -109,8 +136,12 @@ func TestDB_Get(t *testing.T) {
 		t.Fatalf("failed to init db: %v\n", err)
 	}
 
-	val := db.Get([]byte("12345"))
+	val, err := db.Get([]byte("12345"))
 	if val == nil {
-		t.Fatalf("failed to retrive val: \n")
+		t.Fatalf("failed to retrive val: %v\n", err)
+	}
+
+	if bytes.Compare(val, []byte("1234567890")) != 0 {
+		t.Fatalf("wrong value")
 	}
 }

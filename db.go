@@ -7,7 +7,6 @@ import (
 	"errors"
 	"github.com/golang/groupcache/lru"
 	"github.com/golang/groupcache/singleflight"
-	"github.com/ryszard/goskiplist/skiplist"
 	"io"
 	"os"
 	"sort"
@@ -54,8 +53,22 @@ type chunkMeta struct {
 	Chunk *chunk
 }
 
+type chunkMetas []*chunkMeta
+
+func (cm chunkMetas) Len() int {
+	return len(cm)
+}
+
+func (cm chunkMetas) Less(i, j int) bool {
+	return bytes.Compare(cm[i].StartKey, cm[j].StartKey) < 0
+}
+
+func (cm chunkMetas) Swap(i, j int) {
+	cm[i], cm[j] = cm[j], cm[i]
+}
+
 type DB struct {
-	metas     *skiplist.SkipList
+	metas     chunkMetas
 	chunkPool *lru.Cache
 	chunkLock sync.Mutex
 	file      *os.File
@@ -71,6 +84,7 @@ func parseOneChunk(reader *bufio.Reader) (*chunk, error) {
 		// line number, just for test
 		ln++
 		b, err := reader.ReadBytes('\n')
+		b = bytes.TrimSuffix(b, []byte{'\n'})
 		if err != nil {
 			if err == io.EOF {
 				return &tmpchunk, err
@@ -106,7 +120,7 @@ func dumpOneChunk(tmpchunk *chunk, file *os.File, lastLoc *int64, id int) (*chun
 	offset, _ := file.Seek(0, 1)
 
 	// record metadata for this tmpchunk
-	meta.StartLoc = offset
+	meta.StartLoc = *lastLoc
 	meta.ID = id
 	meta.StartKey = tmpchunk.KVs[0].Key
 	meta.Len = offset - *lastLoc
@@ -141,7 +155,7 @@ func (db *DB) preprocess(file *os.File, dump *os.File) error {
 			if meta == nil {
 				return err
 			}
-			db.metas.Set(meta.StartKey, meta)
+			db.metas = append(db.metas, meta)
 		}
 
 		if err == io.EOF {
@@ -150,6 +164,8 @@ func (db *DB) preprocess(file *os.File, dump *os.File) error {
 
 		id++
 	}
+
+	sort.Sort(db.metas)
 
 	return nil
 }
@@ -165,10 +181,6 @@ func (db *DB) Init(path string) error {
 		return err
 	}
 
-	// meta skiplist
-	db.metas = skiplist.NewCustomMap(func(l, r interface{}) bool {
-		return bytes.Compare(l.([]byte), r.([]byte)) == -1
-	})
 	// read and construct each Chunk and Meta
 	if err = db.preprocess(file, dumpfile); err != nil {
 		return err
@@ -184,15 +196,32 @@ func (db *DB) Init(path string) error {
 	return nil
 }
 
-func (db *DB) Get(key []byte) []byte {
-	iter := db.metas.Seek(key)
+// lower bound search
+func (db *DB) lowerSearchMeta(key []byte) (*chunkMeta, int) {
+	first, middle := 0, 0
+	leng := len(db.metas)
 
-	if iter == nil {
-		return nil
+	for leng > 0 {
+		half := leng / 2
+		middle = first + half
+		if bytes.Compare(db.metas[middle].StartKey, key) < 0 {
+			first = middle + 1
+			leng = leng - half - 1
+		} else {
+			leng = half
+		}
+	}
+
+	return db.metas[first], first
+}
+
+func (db *DB) Get(key []byte) ([]byte, error) {
+	meta, _ := db.lowerSearchMeta(key)
+	if meta == nil {
+		return nil, errors.New("no such key")
 	}
 
 	var newchunk *chunk
-	meta := iter.Value().(*chunkMeta)
 	if meta.Chunk != nil {
 		newchunk = meta.Chunk
 	} else {
@@ -207,15 +236,15 @@ func (db *DB) Get(key []byte) []byte {
 			var chunk chunk
 			buffer := bytes.NewBuffer(buf)
 			decoder := gob.NewDecoder(buffer)
-			if err := decoder.Decode(&chunk); err != nil {
+			if err := decoder.Decode(&chunk); err != nil && err != io.EOF {
 				return nil, err
 			}
 
 			return &chunk, nil
 		})
 
-		if err != nil {
-			return nil
+		if c == nil || err != nil {
+			return nil, err
 		}
 
 		// add to lru
@@ -231,9 +260,9 @@ func (db *DB) Get(key []byte) []byte {
 		return bytes.Compare(newchunk.KVs[i].Key, key) == 0
 	})
 
-	if idx > len(newchunk.KVs) {
-		return nil
+	if idx >= len(newchunk.KVs) {
+		return nil, errors.New("no such key: " + string(key))
 	} else {
-		return newchunk.KVs[idx].Value
+		return newchunk.KVs[idx].Value, nil
 	}
 }
